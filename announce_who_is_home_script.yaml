@@ -1,0 +1,176 @@
+blueprint:
+  name: Announce who is home on Google speakers (script)
+  description: >
+    Speaks out which people are currently home on one or more Google
+    (Cast) speakers. Run it from a dashboard, an automation, or by voice
+    through Google Assistant / Gemini once the script is exposed.
+  domain: script
+  author: Hans
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    persons:
+      name: People to check
+      description: Person entities to include in the announcement.
+      selector:
+        entity:
+          domain: person
+          multiple: true
+    speakers:
+      name: Google speakers
+      description: Speakers that should read out the announcement.
+      selector:
+        entity:
+          domain: media_player
+          integration: cast
+          multiple: true
+    tts_entity:
+      name: Text-to-speech engine
+      description: TTS entity used to generate speech (e.g. tts.google_translate_en_com or Home Assistant Cloud).
+      selector:
+        entity:
+          domain: tts
+    language:
+      name: Language (optional)
+      description: Language code such as en, sv or de. Leave empty to use the engine default.
+      default: ""
+      selector:
+        text: {}
+    message_some_home:
+      name: Message when someone is home
+      description: Use {names} as placeholder for the list of people.
+      default: "Currently at home: {names}."
+      selector:
+        text: {}
+    message_one_home:
+      name: Message when exactly one person is home (optional)
+      description: Use {names} as placeholder. Leave empty to use the message above.
+      default: "{names} is home."
+      selector:
+        text: {}
+    message_nobody_home:
+      name: Message when nobody is home
+      default: "Nobody is home right now."
+      selector:
+        text: {}
+    and_word:
+      name: Word used before the last name
+      description: For example "and" (English), "och" (Swedish), "und" (German).
+      default: "and"
+      selector:
+        text: {}
+    announce_volume:
+      name: Announcement volume (optional)
+      description: Set speaker volume before speaking. 0 leaves the volume unchanged.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.05
+          mode: slider
+    restore_volume:
+      name: Restore previous volume afterwards
+      default: true
+      selector:
+        boolean: {}
+    only_if_someone_home:
+      name: Stay silent when nobody is home
+      description: If enabled, nothing is spoken when no one is home.
+      default: false
+      selector:
+        boolean: {}
+
+mode: single
+max_exceeded: silent
+
+variables:
+  persons: !input persons
+  speakers: !input speakers
+  tts_entity: !input tts_entity
+  language: !input language
+  message_some_home: !input message_some_home
+  message_one_home: !input message_one_home
+  message_nobody_home: !input message_nobody_home
+  and_word: !input and_word
+  announce_volume: !input announce_volume
+  restore_volume: !input restore_volume
+  only_if_someone_home: !input only_if_someone_home
+  home_names: >-
+    {{ expand(persons)
+       | selectattr('state', 'eq', 'home')
+       | map(attribute='name')
+       | list }}
+  names_text: >-
+    {% set n = home_names %}
+    {% if n | length == 0 %}
+      {{ '' }}
+    {% elif n | length == 1 %}
+      {{ n[0] }}
+    {% else %}
+      {{ n[:-1] | join(', ') }} {{ and_word }} {{ n[-1] }}
+    {% endif %}
+  message: >-
+    {% if home_names | length == 0 %}
+      {{ message_nobody_home }}
+    {% elif home_names | length == 1 and message_one_home | trim != '' %}
+      {{ message_one_home | replace('{names}', names_text | trim) }}
+    {% else %}
+      {{ message_some_home | replace('{names}', names_text | trim) }}
+    {% endif %}
+
+sequence:
+  # Stop here if there is nothing to say
+  - condition: template
+    value_template: "{{ speakers | length > 0 and (home_names | length > 0 or not only_if_someone_home) }}"
+
+  # Remember current volumes so they can be restored afterwards
+  - variables:
+      previous_volumes: >-
+        {% set ns = namespace(v={}) %}
+        {% for s in speakers %}
+          {% set ns.v = dict(ns.v, **{s: state_attr(s, 'volume_level')}) %}
+        {% endfor %}
+        {{ ns.v }}
+
+  - if:
+      - condition: template
+        value_template: "{{ announce_volume | float(0) > 0 }}"
+    then:
+      - action: media_player.volume_set
+        target:
+          entity_id: !input speakers
+        data:
+          volume_level: "{{ announce_volume | float }}"
+
+  - action: tts.speak
+    target:
+      entity_id: !input tts_entity
+    data:
+      media_player_entity_id: !input speakers
+      message: "{{ message | trim }}"
+      cache: false
+      language: "{{ language if language | trim != '' else omit }}"
+
+  # Wait for the speakers to finish talking before restoring volume
+  - if:
+      - condition: template
+        value_template: "{{ announce_volume | float(0) > 0 and restore_volume }}"
+    then:
+      - delay:
+          seconds: 2
+      - repeat:
+          for_each: "{{ speakers }}"
+          sequence:
+            - wait_template: "{{ not is_state(repeat.item, 'playing') }}"
+              timeout: "00:01:00"
+              continue_on_timeout: true
+            - if:
+                - condition: template
+                  value_template: "{{ previous_volumes[repeat.item] is number }}"
+              then:
+                - action: media_player.volume_set
+                  target:
+                    entity_id: "{{ repeat.item }}"
+                  data:
+                    volume_level: "{{ previous_volumes[repeat.item] }}"
